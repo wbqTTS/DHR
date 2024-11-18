@@ -101,10 +101,10 @@ def monitor_icmp_realtime(interface, controller_ip, h1_ip, h2_ip, threshold,
             if majority_decision(selected_predictions):
                 print("检测到异常流量，开始阻断...")
                 block_ping(controller_ip, h1_ip, h2_ip)
-                return  # 一旦阻断，停止监控
+                break  # 一旦阻断，停止监控
         except Exception as e:
             print(f"监控时发生错误: {e}")
-            return
+            break
 
 
 def block_ping(controller_ip, h1_ip, h2_ip):
