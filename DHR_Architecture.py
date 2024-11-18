@@ -1,8 +1,7 @@
 import csv
 import time
 import threading
-from turtle import pd
-
+import pandas as pd
 import joblib
 from mininet.topo import Topo
 from mininet.net import Mininet
@@ -16,6 +15,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 import random
+import warnings
 
 
 class MyTopo(Topo):
@@ -30,19 +30,28 @@ class MyTopo(Topo):
         self.addLink(h3, s1)
 
 # 随机调度三个预测结果
-def dispatch_predictions(predictions, num=3):
+def dispatch_predictions(models, num=3):
     """
     随机选择三个预测结果
     :param predictions: 预测结果的字典
     :param num: 要选择的数量
     :return: 选择的预测结果 (01 列表)
     """
-    selected = random.sample(list(predictions.values()), num)
-    return selected
+    selected_keys = random.sample(list(models.keys()), num)  # 随机选择键
+    selected = {key: models[key] for key in selected_keys}  # 选出对应的键值对
+
+    # 打印选择的 key 和对应的值
+    print("Selected models:")
+    for key, value in selected.items():
+        print(f"model: {key}")
+
+    return list(selected.values())
 
 def majority_decision(results):
     # 多模裁决机制：基于多数投票来判断是否异常流量
+    print("多模裁决...")
     decision = sum(results) >= len(results) / 2  # 如果超过一半为异常，则认为是异常
+    print(f"裁决结果：{'异常流量' if decision == 1 else '正常流量'}")
     return decision
 
 def monitor_icmp_realtime(interface, controller_ip, h1_ip, h2_ip, threshold,
@@ -63,17 +72,22 @@ def monitor_icmp_realtime(interface, controller_ip, h1_ip, h2_ip, threshold,
 
             # 提取特征用于机器学习模型预测
             features = [icmp_count, byte_count, icmp_count_perSec]
+            print(f"当前流量Features: {features}")
 
-            # 使用 SVM 和随机森林模型预测
+            # 使用 SVM 模型预测
             svm_prediction = svm_model.predict([features])[0]
+            # 使用 随机森林 模型预测
             rf_prediction = rf_model.predict([features])[0]
+            # 使用 knn 模型预测
             knn_prediction = knn_model.predict([features])[0]
-            normal_prediction = icmp_count_perSec > threshold
+            # 使用 普通 模型预测
+            normal_prediction = int(icmp_count_perSec > threshold)
+
             print(f"SVM 模型预测: {svm_prediction}, 随机森林模型预测: {rf_prediction}, "
                   f"knn模型预测：{knn_prediction}, 普通预测："
                   f"{normal_prediction}")
 
-            predictions = {
+            models = {
                 "svm": svm_prediction,
                 "rf": rf_prediction,
                 "knn": knn_prediction,
@@ -81,16 +95,16 @@ def monitor_icmp_realtime(interface, controller_ip, h1_ip, h2_ip, threshold,
             }
 
             # 调度算法
-            selected_predictions = dispatch_predictions(predictions, num=3)
+            selected_predictions = dispatch_predictions(models, num=3)
 
             # 多模测试
             if majority_decision(selected_predictions):
                 print("检测到异常流量，开始阻断...")
                 block_ping(controller_ip, h1_ip, h2_ip)
-                break  # 一旦阻断，停止监控
+                return  # 一旦阻断，停止监控
         except Exception as e:
             print(f"监控时发生错误: {e}")
-            break
+            return
 
 
 def block_ping(controller_ip, h1_ip, h2_ip):
@@ -114,62 +128,77 @@ def block_ping(controller_ip, h1_ip, h2_ip):
     else:
         print("流表规则下发失败:", response.text)
 
+# 执行 ping 命令的线程函数
+def ping_host(host, cmd):
+    try:
+        host.cmd(cmd)
+    except Exception as e:
+        print(f"Ping 命令执行失败: {e}")
 
-# 用于持续生成数据集的函数
+# 生成数据集
 def generate_dataset(h1, h2, s1, duration=20, interval=2):
     print("开始模型训练...")
 
     # 创建一个 CSV 文件来保存数据集
     with open('traffic_dataset.csv', mode='w', newline='') as file:
         writer = csv.writer(file)
-        # 写入 CSV 文件的表头
         writer.writerow(['icmp_count', 'byte_count', 'rate', 'label'])
 
-        # 1. 正常流量数据集： h1 ping h2
-        print("收集正常流量数据...")
+        # 捕获正常流量数据集
+        print("收集正常流量数据（ping流量）...")
+        interface = s1.intf('s1-eth1').name  # 获取网络接口名称
 
-        # 启动一个新的线程，持续收集 ICMP 包数据
+        # 定义 ping 命令
+        normal_ping_cmd = f'timeout {duration + 2}s ping {h2.IP()}'
+
+        # 启动线程执行 ping 命令
+        ping_thread = threading.Thread(target=ping_host, args=(h1, normal_ping_cmd))
+        ping_thread.start()
+
+        # 捕获流量
         start_time = time.time()
-
-        # 启动 ping 命令
-        h1.cmd('timeout 22s ping %s' % h2.IP())
-
         while time.time() - start_time < duration:
-            # 捕获数据包
-            interface = s1.intf('s1-eth1').name
-            packets = sniff(filter="icmp", iface=interface, timeout=interval)
-
-            # 提取特征
+            packets = sniff(filter="icmp", iface=interface, timeout=2)
             icmp_count = len([pkt for pkt in packets if pkt.haslayer('ICMP')])
-            byte_count = sum(len(pkt) for pkt in packets if pkt.haslayer('ICMP'))
+            byte_count = sum(len(pkt) for pkt in packets)
             rate = icmp_count / interval
-
-            # 将数据写入 CSV 文件（正常流量标签为 0）
             writer.writerow([icmp_count, byte_count, rate, 0])
             print(f"正常流量：icmp_count={icmp_count}, byte_count={byte_count}, rate={rate}")
 
+        # 确保 ping 线程完成
+        ping_thread.join()
 
-        # 2. 异常流量数据集： h1 ping -f h2
-        print("收集异常流量数据...")
-
-        # 启动 ping -f 命令
+        # 捕获流量（无流量时，也属于正常流量）
+        print("收集正常流量数据（无流量）...")
         start_time = time.time()
-        # 发起频繁的 ping
-        h1.cmd('timeout 22s ping -f %s' % h2.IP())
-
-
         while time.time() - start_time < duration:
-            # 捕获数据包
-            packets = sniff(filter="icmp", iface=interface, timeout=interval)
-
-            # 提取特征
+            packets = sniff(filter="icmp", iface=interface, timeout=2)
             icmp_count = len([pkt for pkt in packets if pkt.haslayer('ICMP')])
-            byte_count = sum(len(pkt) for pkt in packets if pkt.haslayer('ICMP'))
+            byte_count = sum(len(pkt) for pkt in packets)
             rate = icmp_count / interval
+            writer.writerow([icmp_count, byte_count, rate, 0])
+            print(f"正常流量：icmp_count={icmp_count}, byte_count={byte_count}, rate={rate}")
 
-            # 将数据写入 CSV 文件（异常流量标签为 1）
+        # 捕获异常流量数据集
+        print("收集异常流量数据...")
+        abnormal_ping_cmd = f'timeout {duration*2 + 4}s ping -f {h2.IP()}'
+
+        # 启动线程执行 ping -f 命令
+        ping_thread = threading.Thread(target=ping_host, args=(h1, abnormal_ping_cmd))
+        ping_thread.start()
+
+        # 捕获流量
+        start_time = time.time()
+        while time.time() - start_time < duration*2:
+            packets = sniff(filter="icmp", iface=interface, timeout=2)
+            icmp_count = len([pkt for pkt in packets if pkt.haslayer('ICMP')])
+            byte_count = sum(len(pkt) for pkt in packets)
+            rate = icmp_count / interval
             writer.writerow([icmp_count, byte_count, rate, 1])
             print(f"异常流量：icmp_count={icmp_count}, byte_count={byte_count}, rate={rate}")
+
+        # 确保 ping 线程完成
+        ping_thread.join()
 
     print("数据集生成完毕，已保存为 'traffic_dataset.csv'")
 
@@ -188,7 +217,7 @@ def train_knn_model(csv_file, k=3):
     data = pd.read_csv(csv_file)
 
     # 数据预处理
-    X = data[['packet_count', 'byte_count', 'rate']]  # 特征列
+    X = data[['icmp_count', 'byte_count', 'rate']]  # 特征列
     y = data['label']  # 标签列
 
     # 将数据集划分为训练集和测试集
@@ -236,28 +265,6 @@ def train_random_forest_model(csv_file):
     print("模型训练完成并保存为 'random_forest_model.pkl'")
 
 
-def predict_with_random_forest_model(csv_file, model_file='random_forest_model.pkl'):
-    # 加载数据集
-    df = pd.read_csv(csv_file)
-
-    # 提取特征
-    X = df[['icmp_count', 'byte_count', 'rate']]
-
-    # 加载训练好的模型
-    rf_model = joblib.load(model_file)
-
-    # 进行预测
-    y_pred = rf_model.predict(X)
-
-    # 输出预测结果
-    print(f"预测标签：{y_pred}")
-    return y_pred
-
-
-
-
-
-
 # ---------------------svm------------------------
 # svm模型预测是否异常流量
 def train_svm_model(csv_file):
@@ -287,31 +294,6 @@ def train_svm_model(csv_file):
     # 保存模型到文件
     joblib.dump(svm_model, 'svm_model.pkl')
     print("模型训练完成并保存为 'svm_model.pkl'")
-
-
-def predict_with_svm_model(csv_file, model_file='svm_model.pkl'):
-    """
-    使用训练好的 SVM 模型进行预测
-    :param csv_file: 数据集文件名
-    :param model_file: 训练好的模型文件名
-    :return: 预测结果
-    """
-    # 加载数据集
-    df = pd.read_csv(csv_file)
-
-    # 提取特征
-    X = df[['icmp_count', 'byte_count', 'rate']]
-
-    # 加载训练好的 SVM 模型
-    svm_model = joblib.load(model_file)
-
-    # 进行预测
-    y_pred = svm_model.predict(X)
-
-    # 输出预测结果
-    print(f"预测标签：{y_pred}")
-    return y_pred
-
 
 
 
@@ -351,16 +333,18 @@ def run():
     print("发起 h1 ping h2(模拟正常流量), 10 秒后自动停止...")
     h1.cmd('timeout 10s ping %s' % h2.IP())
 
-    # 等待 13 秒后启动高频 ping
-    time.sleep(13)
     print("发起 h1 ping -f h2(模拟ddos攻击)")
-    h1.cmd('ping -f -c 100 %s' % h2.IP())
+    h1.cmd('ping -f %s' % h2.IP())
 
     # 等待监控线程结束
     monitor_thread.join()
 
+    print("关闭网络拓扑...")
     net.stop()
+    time.sleep(5)  # 休眠 5 秒
+    print("实验结束！")
 
 
 if __name__ == '__main__':
+    warnings.filterwarnings("ignore", message="X does not have valid feature names")
     run()
